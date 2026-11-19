@@ -14,13 +14,16 @@ permissions:
 env:
   IMAGE: ghcr.io/usurnamedzairy/bara-gpu-worker
 
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  publish:
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: read
-      packages: write
     steps:
       - name: Require a version tag
         env:
@@ -42,8 +45,20 @@ jobs:
 
       - name: Run the tests
         run: |
-          pip install pytest
+          pip install pytest==8.4.2
           python -m pytest -q
+
+  publish:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # The base image is about 15 GB; the runner needs the room.
       - name: Free disk space
@@ -87,3 +102,7 @@ jobs:
             echo
             echo "\`$IMAGE@$DIGEST\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Disk after the build
+        if: always()
+        run: df -h
