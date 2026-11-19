@@ -215,7 +215,8 @@ def test_two_workers_racing_download_each_file_once(manifest, server, tmp_path):
     root = tmp_path / "models"
     results, errors = _race(manifest, root, server)
     assert errors == []
-    assert sorted(len(r) for r in results) == [0, len(FILES)]  # the second one finds it done
+    # locks are per file, so the two may split the files, but none is downloaded twice
+    assert sorted(path for r in results for path in r) == sorted(FILES)
     assert sorted(server["requests"]) == sorted("/" + p for p in FILES)
     _assert_done_and_clean(root)
 
@@ -231,3 +232,38 @@ def test_two_workers_racing_without_a_working_lock_do_not_corrupt_each_other(
     results, errors = _race(manifest, root, server)
     assert errors == []
     _assert_done_and_clean(root)
+
+
+def _plant_part(root, path, name, age_s=0):
+    part = root / (path + ".part." + name)
+    part.parent.mkdir(parents=True, exist_ok=True)
+    part.write_bytes(b"leftover of a killed worker")
+    if age_s:
+        t = time.time() - age_s
+        os.utime(part, (t, t))
+    return part
+
+
+def test_removes_the_parts_a_crashed_worker_left_behind_under_the_lock(manifest, tmp_path):
+    root = tmp_path / "models"
+    stale = _plant_part(root, "vae/b.safetensors", "999.deadbeef")
+    ensure_weights(manifest, str(root))
+    assert not stale.exists()
+    # also when the file itself is already in place
+    again = _plant_part(root, "vae/b.safetensors", "1000.cafebabe")
+    assert ensure_weights(manifest, str(root)) == []
+    assert not again.exists()
+    _assert_done_and_clean(root)
+
+
+def test_without_a_lock_only_old_parts_are_removed(manifest, tmp_path, monkeypatch):
+    def no_flock(fd, op):
+        raise OSError("flock not supported on this filesystem")
+
+    monkeypatch.setattr(ew.fcntl, "flock", no_flock)
+    root = tmp_path / "models"
+    fresh = _plant_part(root, "vae/b.safetensors", "1.fresh")  # maybe a live writer's
+    old = _plant_part(root, "vae/b.safetensors", "2.old", age_s=7 * 3600)
+    ensure_weights(manifest, str(root))
+    assert fresh.exists()
+    assert not old.exists()

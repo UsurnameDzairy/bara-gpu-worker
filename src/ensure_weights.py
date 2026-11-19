@@ -17,14 +17,17 @@ corrupting each other; the cost is a duplicate download.
 """
 import contextlib
 import fcntl
+import glob
 import hashlib
 import json
 import os
 import sys
+import time
 import urllib.request
 import uuid
 
 CHUNK = 8 * 1024 * 1024  # 8 MiB
+STALE_PART_SECONDS = 6 * 3600  # without a lock, a part this old has no live writer
 
 
 def _sha256_of(path):
@@ -66,8 +69,8 @@ def _is_current(dest, entry):
 
 def _download(entry, dest):
     part = "%s.part.%d.%s" % (dest, os.getpid(), uuid.uuid4().hex[:8])
-    if os.path.exists(_marker_path(dest)):
-        os.remove(_marker_path(dest))  # stale: it vouched for the file being replaced
+    with contextlib.suppress(FileNotFoundError):  # stale: it vouched for the file being replaced
+        os.remove(_marker_path(dest))
     h = hashlib.sha256()
     try:
         with urllib.request.urlopen(entry["url"], timeout=60) as resp, open(part, "wb") as out:
@@ -90,9 +93,22 @@ def _locked(dest):
     with open(dest + ".lock", "w") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX)
+            locked = True
         except OSError as e:  # e.g. a network filesystem without flock
             print("ensure_weights: no file lock (%s), relying on atomic rename" % e, flush=True)
-        yield  # closing the file releases the lock
+            locked = False
+        yield locked  # closing the file releases the lock
+
+
+def _remove_leftover_parts(dest, locked):
+    """Parts of killed workers would fill the volume for good (up to ~10 GB each).
+
+    Under the lock nobody else writes, so all go. Without it, only old ones.
+    """
+    for part in glob.glob(glob.escape(dest) + ".part.*"):
+        with contextlib.suppress(FileNotFoundError):
+            if locked or time.time() - os.path.getmtime(part) > STALE_PART_SECONDS:
+                os.remove(part)
 
 
 def ensure_weights(manifest, root):
@@ -105,7 +121,8 @@ def ensure_weights(manifest, root):
         dest = os.path.realpath(os.path.join(root, entry["path"]))
         if os.path.commonpath([root, dest]) != root:
             raise ValueError("manifest path leaves the root: %s" % entry["path"])
-        with _locked(dest):
+        with _locked(dest) as locked:
+            _remove_leftover_parts(dest, locked)
             if _is_current(dest, entry):  # also true when another worker just finished it
                 continue
             print("ensure_weights: downloading %s (%d bytes)" % (entry["path"], entry["size"]), flush=True)
