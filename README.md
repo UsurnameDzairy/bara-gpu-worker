@@ -64,6 +64,15 @@ python3 -m pytest -q
 
 The image is built and published by CI on tags (no local `docker build` needed).
 
+## Releases
+
+Pushing a tag `vX.Y.Z` runs `.github/workflows/publish.yml`: tests, then a
+`linux/amd64` build pushed to `ghcr.io/usurnamedzairy/bara-gpu-worker` with two
+tags, the git tag and the commit sha (no `latest`). The job summary prints the
+`@sha256:` digest, which is what Bara pins. To re-run a release, start the
+workflow by hand from that tag ("Use workflow from"). Only the automatic
+`GITHUB_TOKEN` is used. The package must be set to Public once in GitHub.
+
 ## Licences
 
 AGPL-3.0 (this repository, like the base worker), GPL-3.0 (ComfyUI), Apache-2.0
