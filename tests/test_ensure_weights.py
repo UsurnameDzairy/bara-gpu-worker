@@ -2,7 +2,8 @@ import hashlib
 import json
 import os
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
@@ -17,7 +18,7 @@ FILES = {
 
 @pytest.fixture
 def server():
-    state = {"requests": [], "status": 200}
+    state = {"requests": [], "status": 200, "delay": 0}
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -30,12 +31,15 @@ def server():
             self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            self.wfile.write(body[: len(body) // 2])
+            self.wfile.flush()
+            time.sleep(state["delay"])  # keeps two racing downloads overlapped
+            self.wfile.write(body[len(body) // 2 :])
 
         def log_message(self, *args):
             pass
 
-    httpd = HTTPServer(("127.0.0.1", 0), Handler)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     state["base"] = "http://127.0.0.1:%d" % httpd.server_port
     yield state
@@ -64,7 +68,7 @@ def test_downloads_missing_files(manifest, tmp_path):
     assert sorted(got) == sorted(FILES)
     for path, data in FILES.items():
         assert (root / path).read_bytes() == data
-    assert not list(root.rglob("*.part"))
+    assert not list(root.rglob("*.part*"))
 
 
 def test_skips_files_with_the_right_hash(manifest, server, tmp_path):
@@ -95,7 +99,7 @@ def test_leaves_no_part_file_after_a_failed_download(manifest, server, tmp_path)
     server["status"] = 500
     with pytest.raises(Exception):
         ensure_weights(manifest, str(root))
-    assert not list(root.rglob("*.part"))
+    assert not list(root.rglob("*.part*"))
     assert target.read_bytes() == b"old"
 
 
@@ -111,7 +115,7 @@ def test_refuses_a_download_whose_hash_does_not_match(server, tmp_path):
     with pytest.raises(ValueError):
         ensure_weights(str(p), str(root))
     assert not (root / path).exists()
-    assert not list(root.rglob("*.part"))
+    assert not list(root.rglob("*.part*"))
 
 
 def test_refuses_a_path_that_leaves_the_root(tmp_path):
@@ -181,3 +185,49 @@ def test_removes_a_stale_marker_before_redownloading(manifest, server, tmp_path)
     with pytest.raises(Exception):
         ensure_weights(manifest, str(root))
     assert not _marker(root, path).exists()
+
+
+def _race(manifest, root, server, n=2):
+    server["delay"] = 0.3
+    results, errors = [], []
+
+    def run():
+        try:
+            results.append(ensure_weights(manifest, str(root)))
+        except BaseException as e:  # noqa: BLE001 - the test reports any failure
+            errors.append(e)
+
+    threads = [threading.Thread(target=run) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return results, errors
+
+
+def _assert_done_and_clean(root):
+    for path, data in FILES.items():
+        assert (root / path).read_bytes() == data
+    assert not list(root.rglob("*.part*"))
+
+
+def test_two_workers_racing_download_each_file_once(manifest, server, tmp_path):
+    root = tmp_path / "models"
+    results, errors = _race(manifest, root, server)
+    assert errors == []
+    assert sorted(len(r) for r in results) == [0, len(FILES)]  # the second one finds it done
+    assert sorted(server["requests"]) == sorted("/" + p for p in FILES)
+    _assert_done_and_clean(root)
+
+
+def test_two_workers_racing_without_a_working_lock_do_not_corrupt_each_other(
+    manifest, server, tmp_path, monkeypatch
+):
+    def no_flock(fd, op):
+        raise OSError("flock not supported on this filesystem")
+
+    monkeypatch.setattr(ew.fcntl, "flock", no_flock)
+    root = tmp_path / "models"
+    results, errors = _race(manifest, root, server)
+    assert errors == []
+    _assert_done_and_clean(root)

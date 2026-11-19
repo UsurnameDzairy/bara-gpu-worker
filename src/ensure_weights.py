@@ -4,16 +4,25 @@ Usage: python ensure_weights.py <manifest.json> <root>
 
 The manifest is a JSON list of {"path", "url", "size", "sha256"}. A file is
 (re)downloaded when it is missing or its SHA-256 differs. Downloads go to
-<root>/<path>.part, are hashed while streaming, and are renamed only when the
+<root>/<path>.part.<unique>, are hashed while streaming, and are renamed only when the
 hash matches. A verified file gets a marker <path>.sha256 holding its digest:
 on later starts a file with the right size and a matching marker is trusted
 without re-hashing (the customer's GPU is billed while a cold start hashes 18 GB).
+
+Several workers can start together on one volume: each file is handled under an
+exclusive flock on <path>.lock (the check runs again once the lock is held, so
+the second worker finds the file done). If the filesystem has no working flock,
+the unique part names and the atomic rename still keep two writers from
+corrupting each other; the cost is a duplicate download.
 """
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
 import sys
 import urllib.request
+import uuid
 
 CHUNK = 8 * 1024 * 1024  # 8 MiB
 
@@ -56,8 +65,7 @@ def _is_current(dest, entry):
 
 
 def _download(entry, dest):
-    part = dest + ".part"
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    part = "%s.part.%d.%s" % (dest, os.getpid(), uuid.uuid4().hex[:8])
     if os.path.exists(_marker_path(dest)):
         os.remove(_marker_path(dest))  # stale: it vouched for the file being replaced
     h = hashlib.sha256()
@@ -76,6 +84,17 @@ def _download(entry, dest):
         raise
 
 
+@contextlib.contextmanager
+def _locked(dest):
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    with open(dest + ".lock", "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        except OSError as e:  # e.g. a network filesystem without flock
+            print("ensure_weights: no file lock (%s), relying on atomic rename" % e, flush=True)
+        yield  # closing the file releases the lock
+
+
 def ensure_weights(manifest, root):
     """Make every file of the manifest present under root; return the paths downloaded."""
     with open(manifest, encoding="utf-8") as f:
@@ -86,11 +105,12 @@ def ensure_weights(manifest, root):
         dest = os.path.realpath(os.path.join(root, entry["path"]))
         if os.path.commonpath([root, dest]) != root:
             raise ValueError("manifest path leaves the root: %s" % entry["path"])
-        if _is_current(dest, entry):
-            continue
-        print("ensure_weights: downloading %s (%d bytes)" % (entry["path"], entry["size"]), flush=True)
-        _download(entry, dest)
-        downloaded.append(entry["path"])
+        with _locked(dest):
+            if _is_current(dest, entry):  # also true when another worker just finished it
+                continue
+            print("ensure_weights: downloading %s (%d bytes)" % (entry["path"], entry["size"]), flush=True)
+            _download(entry, dest)
+            downloaded.append(entry["path"])
     return downloaded
 
 
