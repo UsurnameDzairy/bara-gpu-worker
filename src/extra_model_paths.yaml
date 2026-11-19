@@ -1,0 +1,18 @@
+# Copy of worker-comfyui 5.10.0 src/extra_model_paths.yaml plus two lines.
+# ComfyUI maps `unet` to diffusion_models and `clip` to text_encoders, so the
+# upstream file only looks in models/unet and models/clip on the volume. The
+# Wan weights live in models/diffusion_models and models/text_encoders.
+runpod_worker_comfy:
+  base_path: /runpod-volume
+  checkpoints: models/checkpoints/
+  clip: models/clip/
+  clip_vision: models/clip_vision/
+  configs: models/configs/
+  controlnet: models/controlnet/
+  embeddings: models/embeddings/
+  loras: models/loras/
+  upscale_models: models/upscale_models/
+  vae: models/vae/
+  unet: models/unet/
+  diffusion_models: models/diffusion_models/
+  text_encoders: models/text_encoders/
