@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
+import ensure_weights as ew
 from ensure_weights import ensure_weights
 
 FILES = {
@@ -121,3 +122,62 @@ def test_refuses_a_path_that_leaves_the_root(tmp_path):
     with pytest.raises(ValueError):
         ensure_weights(str(p), str(tmp_path / "models"))
     assert not os.path.exists(tmp_path / "evil")
+
+
+def _marker(root, path):
+    return root / (path + ".sha256")
+
+
+def _digest(path):
+    return hashlib.sha256(FILES[path]).hexdigest()
+
+
+def test_writes_the_marker_after_a_download(manifest, tmp_path):
+    root = tmp_path / "models"
+    ensure_weights(manifest, str(root))
+    for path in FILES:
+        assert _marker(root, path).read_text().strip() == _digest(path)
+
+
+def test_trusts_a_verified_file_without_hashing(manifest, tmp_path, monkeypatch):
+    root = tmp_path / "models"
+    ensure_weights(manifest, str(root))
+
+    def boom(path):
+        raise AssertionError("hashed a verified file")
+
+    monkeypatch.setattr(ew, "_sha256_of", boom)
+    assert ensure_weights(manifest, str(root)) == []
+
+
+def test_rehashes_when_the_size_changed(manifest, tmp_path):
+    root = tmp_path / "models"
+    ensure_weights(manifest, str(root))
+    path = "vae/b.safetensors"
+    (root / path).write_bytes(b"short")  # the marker still names the right digest
+    assert ensure_weights(manifest, str(root)) == [path]
+    assert (root / path).read_bytes() == FILES[path]
+
+
+def test_rehashes_when_the_marker_names_another_digest(manifest, tmp_path, monkeypatch):
+    root = tmp_path / "models"
+    ensure_weights(manifest, str(root))
+    path = "vae/b.safetensors"
+    _marker(root, path).write_text("0" * 64)
+    calls = []
+    real = ew._sha256_of
+    monkeypatch.setattr(ew, "_sha256_of", lambda p: calls.append(p) or real(p))
+    assert ensure_weights(manifest, str(root)) == []  # the bytes are right: kept
+    assert len(calls) == 1
+    assert _marker(root, path).read_text().strip() == _digest(path)
+
+
+def test_removes_a_stale_marker_before_redownloading(manifest, server, tmp_path):
+    root = tmp_path / "models"
+    ensure_weights(manifest, str(root))
+    path = "vae/b.safetensors"
+    (root / path).write_bytes(b"short")
+    server["status"] = 500
+    with pytest.raises(Exception):
+        ensure_weights(manifest, str(root))
+    assert not _marker(root, path).exists()

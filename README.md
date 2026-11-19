@@ -47,8 +47,10 @@ python /src/ensure_weights.py /weights.json /runpod-volume/models
 For each file of `weights.json` (Hugging Face `Comfy-Org/Wan-2.2`, 18.1 GB in
 total), it checks size and SHA-256, downloads what is missing or wrong to
 `<path>.part`, verifies the hash while streaming, then renames. The first start
-on an empty volume therefore downloads 18 GB; the next ones only re-check the
-files. Without a mounted `/runpod-volume` the container stops with a clear
+on an empty volume therefore downloads 18 GB; the next ones skip every file
+whose size matches and whose `<path>.sha256` marker (written once the hash was
+verified) holds the expected digest, so a cold start does not re-hash 18 GB.
+Without a mounted `/runpod-volume` the container stops with a clear
 message.
 
 `src/extra_model_paths.yaml` replaces the base image's file so ComfyUI also
